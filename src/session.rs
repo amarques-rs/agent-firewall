@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Limits {
@@ -9,13 +9,14 @@ pub struct Limits {
     pub ttl_seconds: u64,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ToolRule {
     pub tool_name: String,
     #[serde(default)]
     pub target_pattern: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Session {
     pub tokens_used: u64,
     pub tokens_remaining: u64,
@@ -26,10 +27,16 @@ pub struct Session {
     pub killed: bool,
     #[allow(dead_code)]
     pub policy_id: Option<String>,
+    pub expires_at_unix: u64,
 }
 
 impl Session {
-    pub fn new(limits: Limits, tool_allowlist: Vec<ToolRule>, policy_id: Option<String>) -> Self {
+    pub fn new(
+        limits: Limits,
+        tool_allowlist: Vec<ToolRule>,
+        policy_id: Option<String>,
+        now_unix: u64,
+    ) -> Self {
         let tokens_remaining = limits.max_input_tokens + limits.max_output_tokens;
         Self {
             tokens_used: 0,
@@ -40,6 +47,7 @@ impl Session {
             tool_allowlist,
             killed: false,
             policy_id,
+            expires_at_unix: now_unix.saturating_add(limits.ttl_seconds),
         }
     }
 }

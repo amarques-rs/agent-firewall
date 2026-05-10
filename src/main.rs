@@ -1,6 +1,3 @@
-use std::collections::HashMap;
-use std::sync::Mutex;
-
 use axum::{
     extract::State,
     http::StatusCode,
@@ -15,14 +12,13 @@ use ulid::Ulid;
 mod cost;
 mod policy;
 mod session;
+mod store;
 
-use cost::estimate_usd;
-use policy::tool_allowed;
 use session::{Limits, Session, ToolRule};
+use store::{Outcome, Store};
 
-#[derive(Default)]
 struct AppState {
-    sessions: Mutex<HashMap<String, Session>>,
+    store: Store,
 }
 
 #[derive(Deserialize)]
@@ -79,7 +75,10 @@ struct CheckResp {
 async fn main() {
     tracing_subscriber::fmt().json().init();
 
-    let state = Arc::new(AppState::default());
+    let sled_path = std::env::var("SLED_PATH").unwrap_or_else(|_| "data/firewall.sled".into());
+    let store = Store::open(&sled_path).expect("open sled db");
+    let state = Arc::new(AppState { store });
+
     let app = Router::new()
         .route("/v1/session", post(open_session))
         .route("/v1/check", post(check))
@@ -91,7 +90,7 @@ async fn main() {
         .unwrap_or(8080);
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    tracing::info!(?addr, "listening");
+    tracing::info!(?addr, %sled_path, "listening");
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -99,27 +98,44 @@ async fn open_session(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenSessionReq>,
 ) -> Response {
-    let mut map = state.sessions.lock().unwrap();
-    if let Some(existing) = map.get(&req.session_id) {
-        (StatusCode::OK, Json(view_from(&req.session_id, existing))).into_response()
-    } else {
-        let s = Session::new(req.limits, req.tool_allowlist, req.policy_id);
-        let v = view_from(&req.session_id, &s);
-        map.insert(req.session_id.clone(), s);
-        (StatusCode::CREATED, Json(v)).into_response()
+    match state
+        .store
+        .open_session(&req.session_id, req.limits, req.tool_allowlist, req.policy_id)
+    {
+        Ok(Outcome::Opened { session, is_new }) => {
+            let view = view_from(&req.session_id, &session);
+            let code = if is_new { StatusCode::CREATED } else { StatusCode::OK };
+            (code, Json(view)).into_response()
+        }
+        Ok(_) => unreachable!("open_session returns Opened"),
+        Err(e) => internal_error(e),
     }
 }
 
 async fn check(State(state): State<Arc<AppState>>, Json(req): Json<CheckReq>) -> Response {
-    let mut map = state.sessions.lock().unwrap();
     let audit_id = format!("evt_{}", Ulid::new());
-
     let sid = match &req {
         CheckReq::Model { session_id, .. } | CheckReq::Tool { session_id, .. } => session_id.clone(),
     };
-
-    let Some(s) = map.get_mut(&sid) else {
-        return (
+    let outcome = match req {
+        CheckReq::Model {
+            model,
+            projected_input_tokens,
+            projected_output_tokens,
+            ..
+        } => state
+            .store
+            .check_model(&sid, &model, projected_input_tokens, projected_output_tokens),
+        CheckReq::Tool {
+            tool_name,
+            tool_target,
+            ..
+        } => state.store.check_tool(&sid, &tool_name, tool_target.as_deref()),
+    };
+    match outcome {
+        Ok(Outcome::Allow(s)) => allow(&s, &sid, audit_id),
+        Ok(Outcome::Deny { session, reason }) => deny(&session, &sid, reason, audit_id),
+        Ok(Outcome::NotFound) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "decision": "deny",
@@ -127,52 +143,9 @@ async fn check(State(state): State<Arc<AppState>>, Json(req): Json<CheckReq>) ->
                 "audit_id": audit_id,
             })),
         )
-            .into_response();
-    };
-
-    if s.killed {
-        return deny(s, &sid, "session_killed", audit_id);
-    }
-    if s.calls_remaining == 0 {
-        return deny(s, &sid, "session_budget_exhausted_calls", audit_id);
-    }
-
-    match req {
-        CheckReq::Model {
-            model,
-            projected_input_tokens,
-            projected_output_tokens,
-            ..
-        } => {
-            let Some(usd) = estimate_usd(&model, projected_input_tokens, projected_output_tokens)
-            else {
-                return deny(s, &sid, "unknown_model", audit_id);
-            };
-            let total_tokens = projected_input_tokens + projected_output_tokens;
-            if total_tokens > s.tokens_remaining {
-                return deny(s, &sid, "session_budget_exhausted_tokens", audit_id);
-            }
-            if usd > s.usd_remaining + f64::EPSILON {
-                return deny(s, &sid, "session_budget_exhausted_usd", audit_id);
-            }
-            s.tokens_used += total_tokens;
-            s.tokens_remaining -= total_tokens;
-            s.usd_used += usd;
-            s.usd_remaining -= usd;
-            s.calls_remaining -= 1;
-            allow(s, &sid, audit_id)
-        }
-        CheckReq::Tool {
-            tool_name,
-            tool_target,
-            ..
-        } => {
-            if !tool_allowed(&s.tool_allowlist, &tool_name, tool_target.as_deref()) {
-                return deny(s, &sid, "tool_not_in_allowlist", audit_id);
-            }
-            s.calls_remaining -= 1;
-            allow(s, &sid, audit_id)
-        }
+            .into_response(),
+        Ok(Outcome::Opened { .. }) => unreachable!("check never returns Opened"),
+        Err(e) => internal_error(e),
     }
 }
 
@@ -202,6 +175,15 @@ fn deny(s: &Session, sid: &str, reason: &'static str, audit_id: String) -> Respo
         .into_response()
 }
 
+fn internal_error(e: sled::Error) -> Response {
+    tracing::error!(?e, "sled error");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"decision":"deny","reason":"internal_error"})),
+    )
+        .into_response()
+}
+
 fn view_from(sid: &str, s: &Session) -> SessionView {
     SessionView {
         session_id: sid.to_string(),
@@ -225,12 +207,16 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    fn app() -> Router {
-        let state = Arc::new(AppState::default());
+    fn router_with_store(store: Store) -> Router {
+        let state = Arc::new(AppState { store });
         Router::new()
             .route("/v1/session", post(open_session))
             .route("/v1/check", post(check))
             .with_state(state)
+    }
+
+    fn app() -> Router {
+        router_with_store(Store::temporary().unwrap())
     }
 
     async fn body_json(resp: Response) -> serde_json::Value {
@@ -238,69 +224,84 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    #[tokio::test]
-    async fn opens_session_then_allow_then_deny_on_budget() {
-        let app = app();
-
-        let open = Request::builder()
+    fn open_req(session_id: &str, max_usd: f64, max_calls: u64, ttl: u64) -> Request<Body> {
+        Request::builder()
             .method("POST")
             .uri("/v1/session")
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::to_vec(&serde_json::json!({
-                    "session_id": "sess_smoke",
+                    "session_id": session_id,
                     "limits": {
-                        "max_usd": 0.10,
-                        "max_input_tokens": 10000,
-                        "max_output_tokens": 5000,
-                        "max_calls": 5,
-                        "ttl_seconds": 3600
+                        "max_usd": max_usd,
+                        "max_input_tokens": 100000,
+                        "max_output_tokens": 50000,
+                        "max_calls": max_calls,
+                        "ttl_seconds": ttl
                     },
                     "tool_allowlist": [{"tool_name": "filesystem.read"}]
                 }))
                 .unwrap(),
             ))
-            .unwrap();
+            .unwrap()
+    }
 
-        let resp = app.clone().oneshot(open).await.unwrap();
+    fn check_model_req(session_id: &str, model: &str, input: u64, output: u64) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/check")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "kind": "model",
+                    "session_id": session_id,
+                    "model": model,
+                    "projected_input_tokens": input,
+                    "projected_output_tokens": output
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    }
+
+    fn check_tool_req(session_id: &str, tool_name: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/check")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "kind": "tool",
+                    "session_id": session_id,
+                    "tool_name": tool_name
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn opens_session_then_allow_then_deny_on_budget() {
+        let app = app();
+        let resp = app.clone().oneshot(open_req("sess_smoke", 0.10, 5, 3600)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
 
-        let check_allow = Request::builder()
-            .method("POST")
-            .uri("/v1/check")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&serde_json::json!({
-                    "kind": "model",
-                    "session_id": "sess_smoke",
-                    "model": "claude-haiku-4-5",
-                    "projected_input_tokens": 1000,
-                    "projected_output_tokens": 500
-                }))
+        let v = body_json(
+            app.clone()
+                .oneshot(check_model_req("sess_smoke", "claude-haiku-4-5", 1000, 500))
+                .await
                 .unwrap(),
-            ))
-            .unwrap();
-        let resp = app.clone().oneshot(check_allow).await.unwrap();
-        let v = body_json(resp).await;
+        )
+        .await;
         assert_eq!(v["decision"], "allow");
 
-        let check_deny = Request::builder()
-            .method("POST")
-            .uri("/v1/check")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&serde_json::json!({
-                    "kind": "model",
-                    "session_id": "sess_smoke",
-                    "model": "claude-opus-4-7",
-                    "projected_input_tokens": 9000,
-                    "projected_output_tokens": 4500
-                }))
+        let v = body_json(
+            app.clone()
+                .oneshot(check_model_req("sess_smoke", "claude-opus-4-7", 9000, 4500))
+                .await
                 .unwrap(),
-            ))
-            .unwrap();
-        let resp = app.clone().oneshot(check_deny).await.unwrap();
-        let v = body_json(resp).await;
+        )
+        .await;
         assert_eq!(v["decision"], "deny");
         assert_eq!(v["reason"], "session_budget_exhausted_usd");
     }
@@ -308,60 +309,101 @@ mod tests {
     #[tokio::test]
     async fn tool_allowlist_gating() {
         let app = app();
-        let open = Request::builder()
-            .method("POST")
-            .uri("/v1/session")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&serde_json::json!({
-                    "session_id": "sess_tool",
-                    "limits": {
-                        "max_usd": 5.00,
-                        "max_input_tokens": 100000,
-                        "max_output_tokens": 50000,
-                        "max_calls": 10,
-                        "ttl_seconds": 3600
-                    },
-                    "tool_allowlist": [
-                        {"tool_name": "filesystem.read"}
-                    ]
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-        app.clone().oneshot(open).await.unwrap();
+        app.clone().oneshot(open_req("sess_tool", 5.0, 10, 3600)).await.unwrap();
 
-        let allowed = Request::builder()
-            .method("POST")
-            .uri("/v1/check")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&serde_json::json!({
-                    "kind": "tool",
-                    "session_id": "sess_tool",
-                    "tool_name": "filesystem.read"
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-        let v = body_json(app.clone().oneshot(allowed).await.unwrap()).await;
+        let v = body_json(
+            app.clone().oneshot(check_tool_req("sess_tool", "filesystem.read")).await.unwrap(),
+        )
+        .await;
         assert_eq!(v["decision"], "allow");
 
-        let denied = Request::builder()
-            .method("POST")
-            .uri("/v1/check")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&serde_json::json!({
-                    "kind": "tool",
-                    "session_id": "sess_tool",
-                    "tool_name": "filesystem.write"
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-        let v = body_json(app.clone().oneshot(denied).await.unwrap()).await;
+        let v = body_json(
+            app.clone().oneshot(check_tool_req("sess_tool", "filesystem.write")).await.unwrap(),
+        )
+        .await;
         assert_eq!(v["decision"], "deny");
         assert_eq!(v["reason"], "tool_not_in_allowlist");
+    }
+
+    #[tokio::test]
+    async fn session_survives_restart() {
+        let dir = std::env::temp_dir().join(format!("agent-firewall-test-{}", Ulid::new()));
+        {
+            let store = Store::open(&dir).unwrap();
+            let app = router_with_store(store);
+            app.clone().oneshot(open_req("sess_persist", 1.0, 5, 3600)).await.unwrap();
+            // consume some budget so the persisted state is non-trivial
+            let v = body_json(
+                app.clone()
+                    .oneshot(check_model_req("sess_persist", "claude-haiku-4-5", 1000, 500))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(v["decision"], "allow");
+        }
+        // Reopen the same path
+        let store = Store::open(&dir).unwrap();
+        let app = router_with_store(store);
+        // Reopening with same session_id returns 200 (existing) and preserves counters.
+        let resp = app.clone().oneshot(open_req("sess_persist", 1.0, 5, 3600)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert!(v["calls_remaining"].as_u64().unwrap() < 5, "counters should persist");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn expired_session_denies() {
+        let app = app();
+        app.clone().oneshot(open_req("sess_expired", 1.0, 5, 0)).await.unwrap();
+        // ttl_seconds=0 → expires_at_unix == now → now >= expires_at_unix on the next check
+        let v = body_json(
+            app.clone()
+                .oneshot(check_model_req("sess_expired", "claude-haiku-4-5", 100, 50))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["decision"], "deny");
+        assert_eq!(v["reason"], "session_expired");
+    }
+
+    #[tokio::test]
+    async fn concurrent_checks_do_not_double_count() {
+        // Budget: $0.05. Each opus call: 1000 input + 100 output =
+        //   1000 * 15/1e6 + 100 * 75/1e6 = 0.015 + 0.0075 = 0.0225 USD.
+        // Two fit (0.045); the third would exceed. With 50 concurrent requests
+        // we must see EXACTLY 2 allows + 48 denies.
+        let app = app();
+        app.clone().oneshot(open_req("sess_race", 0.05, 100, 3600)).await.unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..50 {
+            let app = app.clone();
+            handles.push(tokio::spawn(async move {
+                let resp = app
+                    .oneshot(check_model_req("sess_race", "claude-opus-4-7", 1000, 100))
+                    .await
+                    .unwrap();
+                body_json(resp).await
+            }));
+        }
+        let mut allows = 0;
+        let mut denies_usd = 0;
+        for h in handles {
+            let v = h.await.unwrap();
+            match v["decision"].as_str().unwrap() {
+                "allow" => allows += 1,
+                "deny" => {
+                    if v["reason"] == "session_budget_exhausted_usd" {
+                        denies_usd += 1;
+                    }
+                }
+                _ => panic!("unexpected decision"),
+            }
+        }
+        assert_eq!(allows, 2, "exactly 2 calls fit in the budget");
+        assert_eq!(denies_usd, 48, "the other 48 must be USD-exhausted denies");
     }
 }
