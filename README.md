@@ -104,7 +104,7 @@ cargo run --release
 cargo test
 ```
 
-12 integration tests covering atomic CAS under 50-way concurrency, anchored-regex tool gating, kill propagation, proxy-secret middleware, audit-row persistence, and end-to-end metrics-text format assertion.
+13 integration tests covering atomic CAS under 50-way concurrency, anchored-regex tool gating, kill propagation (incl. admin-bearer 401), proxy-secret middleware, audit-row persistence, end-to-end metrics-text format assertion, and the `sessions_active` TTL-filter regression.
 
 ## License
 
