@@ -1,1 +1,18 @@
-/target
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Local sled state / data volume
+/data/
+*.sled
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
