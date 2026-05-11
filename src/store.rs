@@ -24,6 +24,7 @@ impl Store {
         Ok(Self { db })
     }
 
+    #[cfg(test)]
     pub fn temporary() -> sled::Result<Self> {
         let db = sled::Config::new().temporary(true).open()?;
         Ok(Self { db })
@@ -53,14 +54,10 @@ impl Store {
         Ok(Outcome::Opened { session: s, is_new: true })
     }
 
-    pub fn check_model(
-        &self,
-        session_id: &str,
-        model: &str,
-        projected_input: u64,
-        projected_output: u64,
-    ) -> sled::Result<Outcome> {
-        let now = Self::now_unix();
+    fn with_session<F>(&self, session_id: &str, now: u64, mut f: F) -> sled::Result<Outcome>
+    where
+        F: FnMut(&mut Session) -> Outcome,
+    {
         let mut outcome: Option<Outcome> = None;
         self.db
             .update_and_fetch(session_id.as_bytes(), |cur| -> Option<Vec<u8>> {
@@ -70,37 +67,46 @@ impl Store {
                 };
                 let mut s: Session = bincode::deserialize(bytes).expect("decode session");
                 if let Some(reason) = preflight_deny(&s, now) {
-                    outcome = Some(Outcome::Deny { session: s.clone(), reason });
+                    outcome = Some(Outcome::Deny { session: s, reason });
                     return Some(bytes.to_vec());
                 }
-                let Some(usd) = estimate_usd(model, projected_input, projected_output) else {
-                    outcome = Some(Outcome::Deny { session: s.clone(), reason: "unknown_model" });
-                    return Some(bytes.to_vec());
+                let o = f(&mut s);
+                let next = match &o {
+                    Outcome::Allow(_) => bincode::serialize(&s).expect("encode session"),
+                    _ => bytes.to_vec(),
                 };
-                let total = projected_input + projected_output;
-                if total > s.tokens_remaining {
-                    outcome = Some(Outcome::Deny {
-                        session: s.clone(),
-                        reason: "session_budget_exhausted_tokens",
-                    });
-                    return Some(bytes.to_vec());
-                }
-                if usd > s.usd_remaining + f64::EPSILON {
-                    outcome = Some(Outcome::Deny {
-                        session: s.clone(),
-                        reason: "session_budget_exhausted_usd",
-                    });
-                    return Some(bytes.to_vec());
-                }
-                s.tokens_used += total;
-                s.tokens_remaining -= total;
-                s.usd_used += usd;
-                s.usd_remaining -= usd;
-                s.calls_remaining -= 1;
-                outcome = Some(Outcome::Allow(s.clone()));
-                Some(bincode::serialize(&s).expect("encode session"))
+                outcome = Some(o);
+                Some(next)
             })?;
         Ok(outcome.expect("update_and_fetch always invokes closure"))
+    }
+
+    pub fn check_model(
+        &self,
+        session_id: &str,
+        model: &str,
+        projected_input: u64,
+        projected_output: u64,
+    ) -> sled::Result<Outcome> {
+        let now = Self::now_unix();
+        self.with_session(session_id, now, |s| {
+            let Some(usd) = estimate_usd(model, projected_input, projected_output) else {
+                return Outcome::Deny { session: s.clone(), reason: "unknown_model" };
+            };
+            let total = projected_input + projected_output;
+            if total > s.tokens_remaining {
+                return Outcome::Deny { session: s.clone(), reason: "session_budget_exhausted_tokens" };
+            }
+            if usd > s.usd_remaining + f64::EPSILON {
+                return Outcome::Deny { session: s.clone(), reason: "session_budget_exhausted_usd" };
+            }
+            s.tokens_used += total;
+            s.tokens_remaining -= total;
+            s.usd_used += usd;
+            s.usd_remaining -= usd;
+            s.calls_remaining -= 1;
+            Outcome::Allow(s.clone())
+        })
     }
 
     pub fn check_tool(
@@ -110,30 +116,13 @@ impl Store {
         target: Option<&str>,
     ) -> sled::Result<Outcome> {
         let now = Self::now_unix();
-        let mut outcome: Option<Outcome> = None;
-        self.db
-            .update_and_fetch(session_id.as_bytes(), |cur| -> Option<Vec<u8>> {
-                let Some(bytes) = cur else {
-                    outcome = Some(Outcome::NotFound);
-                    return None;
-                };
-                let mut s: Session = bincode::deserialize(bytes).expect("decode session");
-                if let Some(reason) = preflight_deny(&s, now) {
-                    outcome = Some(Outcome::Deny { session: s.clone(), reason });
-                    return Some(bytes.to_vec());
-                }
-                if !tool_allowed(&s.tool_allowlist, tool_name, target) {
-                    outcome = Some(Outcome::Deny {
-                        session: s.clone(),
-                        reason: "tool_not_in_allowlist",
-                    });
-                    return Some(bytes.to_vec());
-                }
-                s.calls_remaining -= 1;
-                outcome = Some(Outcome::Allow(s.clone()));
-                Some(bincode::serialize(&s).expect("encode session"))
-            })?;
-        Ok(outcome.expect("update_and_fetch always invokes closure"))
+        self.with_session(session_id, now, |s| {
+            if !tool_allowed(&s.tool_allowlist, tool_name, target) {
+                return Outcome::Deny { session: s.clone(), reason: "tool_not_in_allowlist" };
+            }
+            s.calls_remaining -= 1;
+            Outcome::Allow(s.clone())
+        })
     }
 }
 

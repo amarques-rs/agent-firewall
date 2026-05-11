@@ -46,16 +46,12 @@ struct SessionView {
 enum CheckReq {
     Model {
         session_id: String,
-        #[serde(default)]
-        agent_id: Option<String>,
         model: String,
         projected_input_tokens: u64,
         projected_output_tokens: u64,
     },
     Tool {
         session_id: String,
-        #[serde(default)]
-        agent_id: Option<String>,
         tool_name: String,
         #[serde(default)]
         tool_target: Option<String>,
@@ -74,20 +70,14 @@ struct CheckResp {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().json().init();
-
     let sled_path = std::env::var("SLED_PATH").unwrap_or_else(|_| "data/firewall.sled".into());
     let store = Store::open(&sled_path).expect("open sled db");
     let state = Arc::new(AppState { store });
-
     let app = Router::new()
         .route("/v1/session", post(open_session))
         .route("/v1/check", post(check))
         .with_state(state);
-
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8080);
+    let port: u16 = std::env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8080);
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     tracing::info!(?addr, %sled_path, "listening");
@@ -118,56 +108,29 @@ async fn check(State(state): State<Arc<AppState>>, Json(req): Json<CheckReq>) ->
         CheckReq::Model { session_id, .. } | CheckReq::Tool { session_id, .. } => session_id.clone(),
     };
     let outcome = match req {
-        CheckReq::Model {
-            model,
-            projected_input_tokens,
-            projected_output_tokens,
-            ..
-        } => state
-            .store
-            .check_model(&sid, &model, projected_input_tokens, projected_output_tokens),
-        CheckReq::Tool {
-            tool_name,
-            tool_target,
-            ..
-        } => state.store.check_tool(&sid, &tool_name, tool_target.as_deref()),
+        CheckReq::Model { model, projected_input_tokens, projected_output_tokens, .. } =>
+            state.store.check_model(&sid, &model, projected_input_tokens, projected_output_tokens),
+        CheckReq::Tool { tool_name, tool_target, .. } =>
+            state.store.check_tool(&sid, &tool_name, tool_target.as_deref()),
     };
     match outcome {
-        Ok(Outcome::Allow(s)) => allow(&s, &sid, audit_id),
-        Ok(Outcome::Deny { session, reason }) => deny(&session, &sid, reason, audit_id),
+        Ok(Outcome::Allow(s)) => decided(&s, &sid, "allow", None, audit_id),
+        Ok(Outcome::Deny { session, reason }) => decided(&session, &sid, "deny", Some(reason), audit_id),
         Ok(Outcome::NotFound) => (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "decision": "deny",
-                "reason": "session_not_found",
-                "audit_id": audit_id,
-            })),
-        )
-            .into_response(),
+            Json(serde_json::json!({"decision":"deny","reason":"session_not_found","audit_id":audit_id})),
+        ).into_response(),
         Ok(Outcome::Opened { .. }) => unreachable!("check never returns Opened"),
         Err(e) => internal_error(e),
     }
 }
 
-fn allow(s: &Session, sid: &str, audit_id: String) -> Response {
+fn decided(s: &Session, sid: &str, decision: &'static str, reason: Option<&'static str>, audit_id: String) -> Response {
     (
         StatusCode::OK,
         Json(CheckResp {
-            decision: "allow",
-            reason: None,
-            session: view_from(sid, s),
-            audit_id,
-        }),
-    )
-        .into_response()
-}
-
-fn deny(s: &Session, sid: &str, reason: &'static str, audit_id: String) -> Response {
-    (
-        StatusCode::OK,
-        Json(CheckResp {
-            decision: "deny",
-            reason: Some(reason),
+            decision,
+            reason,
             session: view_from(sid, s),
             audit_id,
         }),
@@ -185,18 +148,15 @@ fn internal_error(e: sled::Error) -> Response {
 }
 
 fn view_from(sid: &str, s: &Session) -> SessionView {
+    let r = |x: f64| (x * 100.0).round() / 100.0;
     SessionView {
         session_id: sid.to_string(),
         tokens_used: s.tokens_used,
         tokens_remaining: s.tokens_remaining,
-        usd_used: round2(s.usd_used),
-        usd_remaining: round2(s.usd_remaining),
+        usd_used: r(s.usd_used),
+        usd_remaining: r(s.usd_remaining),
         calls_remaining: s.calls_remaining,
     }
-}
-
-fn round2(x: f64) -> f64 {
-    (x * 100.0).round() / 100.0
 }
 
 #[cfg(test)]
@@ -274,6 +234,47 @@ mod tests {
                     "kind": "tool",
                     "session_id": session_id,
                     "tool_name": tool_name
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    }
+
+    fn check_tool_target_req(session_id: &str, tool_name: &str, target: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/check")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "kind": "tool",
+                    "session_id": session_id,
+                    "tool_name": tool_name,
+                    "tool_target": target
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    }
+
+    fn open_with_pattern_req(session_id: &str, tool_name: &str, target_pattern: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/session")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "session_id": session_id,
+                    "limits": {
+                        "max_usd": 5.0,
+                        "max_input_tokens": 100000,
+                        "max_output_tokens": 50000,
+                        "max_calls": 10,
+                        "ttl_seconds": 3600
+                    },
+                    "tool_allowlist": [
+                        {"tool_name": tool_name, "target_pattern": target_pattern}
+                    ]
                 }))
                 .unwrap(),
             ))
@@ -405,5 +406,48 @@ mod tests {
         }
         assert_eq!(allows, 2, "exactly 2 calls fit in the budget");
         assert_eq!(denies_usd, 48, "the other 48 must be USD-exhausted denies");
+    }
+
+    #[tokio::test]
+    async fn regex_target_pattern_anchors() {
+        // Pattern is an anchored regex. The substring-match implementation
+        // (replaced this run) would have allowed the second URL — the regex
+        // implementation must deny it.
+        let app = app();
+        app.clone()
+            .oneshot(open_with_pattern_req(
+                "sess_re",
+                "http.get",
+                r"^https://api\.example\.com/.*",
+            ))
+            .await
+            .unwrap();
+
+        let v = body_json(
+            app.clone()
+                .oneshot(check_tool_target_req(
+                    "sess_re",
+                    "http.get",
+                    "https://api.example.com/users",
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["decision"], "allow", "exact host matches anchored regex");
+
+        let v = body_json(
+            app.clone()
+                .oneshot(check_tool_target_req(
+                    "sess_re",
+                    "http.get",
+                    "https://evil.com/api.example.com/users",
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["decision"], "deny", "anchored regex denies subdomain spoof");
+        assert_eq!(v["reason"], "tool_not_in_allowlist");
     }
 }
