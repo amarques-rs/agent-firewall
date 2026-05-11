@@ -26,7 +26,7 @@ fn build_metrics() -> Metrics {
     let (r, reg) = (Registry::new(), |r: &Registry, c: Box<dyn Collector>| r.register(c).unwrap());
     let check_total = IntCounterVec::new(Opts::new("check_total", "Total /v1/check decisions"), &["decision", "reason"]).unwrap();
     let check_latency = prometheus::Histogram::with_opts(HistogramOpts::new("check_latency_seconds", "/v1/check latency").buckets(vec![0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1])).unwrap();
-    let sessions_active = IntGauge::new("sessions_active", "Active session rows in sled").unwrap();
+    let sessions_active = IntGauge::new("sessions_active", "Sessions with non-expired TTL (expires_at_unix > now)").unwrap();
     let kills_total = IntCounter::new("kills_total", "Successful /v1/session/:id/kill").unwrap();
     reg(&r, Box::new(check_total.clone())); reg(&r, Box::new(check_latency.clone())); reg(&r, Box::new(sessions_active.clone())); reg(&r, Box::new(kills_total.clone()));
     Metrics { check_total, check_latency, sessions_active, kills_total, registry: r }
@@ -679,5 +679,17 @@ mod tests {
         assert!(body.contains("kills_total 1"), "missing kills_total: {body}");
         assert!(body.contains("sessions_active 2"), "missing sessions_active=2 gauge: {body}");
         assert!(body.contains("check_latency_seconds_bucket"), "missing latency histogram: {body}");
+    }
+
+    #[tokio::test]
+    async fn sessions_active_excludes_expired_rows() {
+        // ttl_seconds=0 → expires_at_unix == now at session-open time → already expired
+        // by the time /metrics is scraped. The gauge must report 0, not 1, so the
+        // dashboard shows the buyer's logically-active subscriber count, not raw row count.
+        let app = app();
+        app.clone().oneshot(open_req("sess_expired_gauge", 1.0, 5, 0)).await.unwrap();
+        let resp = app.clone().oneshot(metrics_req()).await.unwrap();
+        let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        assert!(body.contains("sessions_active 0"), "expected sessions_active=0 (expired filtered out): {body}");
     }
 }

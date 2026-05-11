@@ -108,7 +108,8 @@ impl Store {
     }
 
     pub fn count_sessions(&self) -> sled::Result<usize> {
-        Ok(self.db.iter().keys().filter_map(|r| r.ok()).filter(|k| !k.starts_with(b"audit/")).count())
+        let now = Self::now_unix();
+        Ok(self.db.iter().filter_map(|r| r.ok()).filter(|(k, _)| !k.starts_with(b"audit/")).filter(|(_, v)| bincode::deserialize::<Session>(v).expect("decode session").expires_at_unix > now).count())
     }
 
     pub fn kill(&self, session_id: &str) -> sled::Result<bool> {
