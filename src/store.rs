@@ -109,6 +109,18 @@ impl Store {
         })
     }
 
+    pub fn kill(&self, session_id: &str) -> sled::Result<bool> {
+        let mut found = false;
+        self.db.update_and_fetch(session_id.as_bytes(), |cur| -> Option<Vec<u8>> {
+            let bytes = cur?;
+            let mut s: Session = bincode::deserialize(bytes).expect("decode session");
+            s.killed = true;
+            found = true;
+            Some(bincode::serialize(&s).expect("encode session"))
+        })?;
+        Ok(found)
+    }
+
     pub fn check_tool(
         &self,
         session_id: &str,

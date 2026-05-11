@@ -1,6 +1,6 @@
 use axum::{
-    extract::State,
-    http::StatusCode,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
@@ -19,6 +19,7 @@ use store::{Outcome, Store};
 
 struct AppState {
     store: Store,
+    admin_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -72,9 +73,11 @@ async fn main() {
     tracing_subscriber::fmt().json().init();
     let sled_path = std::env::var("SLED_PATH").unwrap_or_else(|_| "data/firewall.sled".into());
     let store = Store::open(&sled_path).expect("open sled db");
-    let state = Arc::new(AppState { store });
+    let admin_token = std::env::var("ADMIN_TOKEN").ok().filter(|s| !s.is_empty());
+    let state = Arc::new(AppState { store, admin_token });
     let app = Router::new()
         .route("/v1/session", post(open_session))
+        .route("/v1/session/:id/kill", post(kill_session))
         .route("/v1/check", post(check))
         .with_state(state);
     let port: u16 = std::env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8080);
@@ -84,20 +87,13 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn open_session(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<OpenSessionReq>,
-) -> Response {
-    match state
-        .store
-        .open_session(&req.session_id, req.limits, req.tool_allowlist, req.policy_id)
-    {
+async fn open_session(State(state): State<Arc<AppState>>, Json(req): Json<OpenSessionReq>) -> Response {
+    match state.store.open_session(&req.session_id, req.limits, req.tool_allowlist, req.policy_id) {
         Ok(Outcome::Opened { session, is_new }) => {
-            let view = view_from(&req.session_id, &session);
             let code = if is_new { StatusCode::CREATED } else { StatusCode::OK };
-            (code, Json(view)).into_response()
+            (code, Json(view_from(&req.session_id, &session))).into_response()
         }
-        Ok(_) => unreachable!("open_session returns Opened"),
+        Ok(_) => unreachable!(),
         Err(e) => internal_error(e),
     }
 }
@@ -108,43 +104,43 @@ async fn check(State(state): State<Arc<AppState>>, Json(req): Json<CheckReq>) ->
         CheckReq::Model { session_id, .. } | CheckReq::Tool { session_id, .. } => session_id.clone(),
     };
     let outcome = match req {
-        CheckReq::Model { model, projected_input_tokens, projected_output_tokens, .. } =>
-            state.store.check_model(&sid, &model, projected_input_tokens, projected_output_tokens),
-        CheckReq::Tool { tool_name, tool_target, .. } =>
-            state.store.check_tool(&sid, &tool_name, tool_target.as_deref()),
+        CheckReq::Model { model, projected_input_tokens, projected_output_tokens, .. } => state.store.check_model(&sid, &model, projected_input_tokens, projected_output_tokens),
+        CheckReq::Tool { tool_name, tool_target, .. } => state.store.check_tool(&sid, &tool_name, tool_target.as_deref()),
     };
     match outcome {
         Ok(Outcome::Allow(s)) => decided(&s, &sid, "allow", None, audit_id),
         Ok(Outcome::Deny { session, reason }) => decided(&session, &sid, "deny", Some(reason), audit_id),
-        Ok(Outcome::NotFound) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"decision":"deny","reason":"session_not_found","audit_id":audit_id})),
-        ).into_response(),
-        Ok(Outcome::Opened { .. }) => unreachable!("check never returns Opened"),
+        Ok(Outcome::NotFound) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"decision":"deny","reason":"session_not_found","audit_id":audit_id}))).into_response(),
+        Ok(Outcome::Opened { .. }) => unreachable!(),
+        Err(e) => internal_error(e),
+    }
+}
+
+async fn kill_session(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Response {
+    if let Some(want) = &state.admin_token {
+        let got = headers.get("authorization").and_then(|h| h.to_str().ok()).and_then(|h| h.strip_prefix("Bearer "));
+        if got != Some(want.as_str()) {
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"unauthorized"}))).into_response();
+        }
+    }
+    match state.store.kill(&session_id) {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"decision":"killed","session_id":session_id}))).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"session_not_found"}))).into_response(),
         Err(e) => internal_error(e),
     }
 }
 
 fn decided(s: &Session, sid: &str, decision: &'static str, reason: Option<&'static str>, audit_id: String) -> Response {
-    (
-        StatusCode::OK,
-        Json(CheckResp {
-            decision,
-            reason,
-            session: view_from(sid, s),
-            audit_id,
-        }),
-    )
-        .into_response()
+    (StatusCode::OK, Json(CheckResp { decision, reason, session: view_from(sid, s), audit_id })).into_response()
 }
 
 fn internal_error(e: sled::Error) -> Response {
     tracing::error!(?e, "sled error");
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({"decision":"deny","reason":"internal_error"})),
-    )
-        .into_response()
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"decision":"deny","reason":"internal_error"}))).into_response()
 }
 
 fn view_from(sid: &str, s: &Session) -> SessionView {
@@ -167,12 +163,17 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    fn router_with_store(store: Store) -> Router {
-        let state = Arc::new(AppState { store });
+    fn router_with_store_and_admin(store: Store, admin_token: Option<String>) -> Router {
+        let state = Arc::new(AppState { store, admin_token });
         Router::new()
             .route("/v1/session", post(open_session))
+            .route("/v1/session/:id/kill", post(kill_session))
             .route("/v1/check", post(check))
             .with_state(state)
+    }
+
+    fn router_with_store(store: Store) -> Router {
+        router_with_store_and_admin(store, None)
     }
 
     fn app() -> Router {
@@ -406,6 +407,79 @@ mod tests {
         }
         assert_eq!(allows, 2, "exactly 2 calls fit in the budget");
         assert_eq!(denies_usd, 48, "the other 48 must be USD-exhausted denies");
+    }
+
+    fn kill_req(session_id: &str, bearer: Option<&str>) -> Request<Body> {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/session/{session_id}/kill"))
+            .header("content-type", "application/json");
+        if let Some(token) = bearer {
+            b = b.header("authorization", format!("Bearer {token}"));
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn kill_propagates_to_subsequent_checks() {
+        // Open, kill, then a check returns deny:session_killed regardless of remaining budget.
+        let app = app();
+        app.clone().oneshot(open_req("sess_kill", 5.0, 10, 3600)).await.unwrap();
+
+        let resp = app.clone().oneshot(kill_req("sess_kill", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["decision"], "killed");
+
+        let v = body_json(
+            app.clone()
+                .oneshot(check_model_req("sess_kill", "claude-haiku-4-5", 100, 50))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["decision"], "deny");
+        assert_eq!(v["reason"], "session_killed");
+
+        let v = body_json(
+            app.clone().oneshot(check_tool_req("sess_kill", "filesystem.read")).await.unwrap(),
+        )
+        .await;
+        assert_eq!(v["decision"], "deny");
+        assert_eq!(v["reason"], "session_killed");
+    }
+
+    #[tokio::test]
+    async fn kill_returns_404_on_missing_session() {
+        let app = app();
+        let resp = app.oneshot(kill_req("sess_ghost", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn kill_requires_admin_token_when_configured() {
+        // ADMIN_TOKEN set on AppState → wrong/missing bearer is 401; correct bearer succeeds.
+        let app = router_with_store_and_admin(Store::temporary().unwrap(), Some("s3cret".into()));
+        app.clone().oneshot(open_req("sess_admin", 5.0, 10, 3600)).await.unwrap();
+
+        let resp = app.clone().oneshot(kill_req("sess_admin", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = app.clone().oneshot(kill_req("sess_admin", Some("wrong"))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = app.clone().oneshot(kill_req("sess_admin", Some("s3cret"))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The session is now killed under admin auth.
+        let v = body_json(
+            app.clone()
+                .oneshot(check_model_req("sess_admin", "claude-haiku-4-5", 100, 50))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["reason"], "session_killed");
     }
 
     #[tokio::test]
