@@ -329,7 +329,7 @@ components:
           description: |
             Sum of remaining input + output budget. The two caps are summed at
             session creation into one fungible pool; `/v1/check` debits
-            `projected_input + projected_output` from this counter.
+            `projected_input_tokens + projected_output_tokens` from this counter.
         usd_used: { type: number, format: double }
         usd_remaining: { type: number, format: double }
         calls_remaining: { type: integer, format: int64 }
