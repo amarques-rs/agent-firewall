@@ -109,6 +109,10 @@ impl Store {
         Ok(())
     }
 
+    pub fn count_sessions(&self) -> sled::Result<usize> {
+        Ok(self.db.iter().keys().filter_map(|r| r.ok()).filter(|k| !k.starts_with(b"audit/")).count())
+    }
+
     pub fn kill(&self, session_id: &str) -> sled::Result<bool> {
         let mut found = false;
         self.db.update_and_fetch(session_id.as_bytes(), |cur| -> Option<Vec<u8>> {

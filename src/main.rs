@@ -3,9 +3,10 @@ use axum::{
     http::{HeaderMap, StatusCode},
     middleware::{from_fn_with_state, Next},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
+use prometheus::Encoder;
 use serde::Deserialize;
 use std::sync::Arc;
 use ulid::Ulid;
@@ -18,10 +19,24 @@ mod store;
 use session::{Limits, Session, ToolRule};
 use store::{CheckOutcome, Store};
 
+struct Metrics { check_total: prometheus::IntCounterVec, check_latency: prometheus::Histogram, sessions_active: prometheus::IntGauge, kills_total: prometheus::IntCounter, registry: prometheus::Registry }
+
+fn build_metrics() -> Metrics {
+    use prometheus::{core::Collector, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Opts, Registry};
+    let (r, reg) = (Registry::new(), |r: &Registry, c: Box<dyn Collector>| r.register(c).unwrap());
+    let check_total = IntCounterVec::new(Opts::new("check_total", "Total /v1/check decisions"), &["decision", "reason"]).unwrap();
+    let check_latency = prometheus::Histogram::with_opts(HistogramOpts::new("check_latency_seconds", "/v1/check latency").buckets(vec![0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1])).unwrap();
+    let sessions_active = IntGauge::new("sessions_active", "Active session rows in sled").unwrap();
+    let kills_total = IntCounter::new("kills_total", "Successful /v1/session/:id/kill").unwrap();
+    reg(&r, Box::new(check_total.clone())); reg(&r, Box::new(check_latency.clone())); reg(&r, Box::new(sessions_active.clone())); reg(&r, Box::new(kills_total.clone()));
+    Metrics { check_total, check_latency, sessions_active, kills_total, registry: r }
+}
+
 struct AppState {
     store: Store,
     admin_token: Option<String>,
     proxy_secret: Option<String>,
+    metrics: Metrics,
 }
 
 #[derive(Deserialize)]
@@ -58,7 +73,7 @@ async fn main() {
     let store = Store::open(&sled_path).expect("open sled db");
     let admin_token = std::env::var("ADMIN_TOKEN").ok().filter(|s| !s.is_empty());
     let proxy_secret = std::env::var("RAPIDAPI_PROXY_SECRET").ok().filter(|s| !s.is_empty());
-    let state = Arc::new(AppState { store, admin_token, proxy_secret });
+    let state = Arc::new(AppState { store, admin_token, proxy_secret, metrics: build_metrics() });
     let app = build_router(state);
     let port: u16 = std::env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8080);
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
@@ -72,7 +87,14 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/session", post(open_session))
         .route("/v1/check", post(check))
         .route_layer(from_fn_with_state(state.clone(), proxy_secret_mw));
-    gated.route("/v1/session/:id/kill", post(kill_session)).with_state(state)
+    gated.route("/v1/session/:id/kill", post(kill_session)).route("/metrics", get(metrics)).with_state(state)
+}
+
+async fn metrics(State(state): State<Arc<AppState>>) -> Response {
+    state.metrics.sessions_active.set(state.store.count_sessions().unwrap_or(0) as i64);
+    let mut buf = Vec::new();
+    prometheus::TextEncoder::new().encode(&state.metrics.registry.gather(), &mut buf).unwrap();
+    (StatusCode::OK, [("content-type", "text/plain; version=0.0.4")], buf).into_response()
 }
 
 async fn proxy_secret_mw(State(state): State<Arc<AppState>>, headers: HeaderMap, req: Request, next: Next) -> Response {
@@ -97,10 +119,20 @@ async fn check(State(state): State<Arc<AppState>>, Json(req): Json<CheckReq>) ->
     let sid = match &req {
         CheckReq::Model { session_id, .. } | CheckReq::Tool { session_id, .. } => session_id.clone(),
     };
-    let outcome = match req {
-        CheckReq::Model { model, projected_input_tokens, projected_output_tokens, .. } => state.store.check_model(&sid, &audit_id, &model, projected_input_tokens, projected_output_tokens),
-        CheckReq::Tool { tool_name, tool_target, .. } => state.store.check_tool(&sid, &audit_id, &tool_name, tool_target.as_deref()),
+    let outcome = {
+        let _t = state.metrics.check_latency.start_timer();
+        match req {
+            CheckReq::Model { model, projected_input_tokens, projected_output_tokens, .. } => state.store.check_model(&sid, &audit_id, &model, projected_input_tokens, projected_output_tokens),
+            CheckReq::Tool { tool_name, tool_target, .. } => state.store.check_tool(&sid, &audit_id, &tool_name, tool_target.as_deref()),
+        }
     };
+    let (decision, reason) = match &outcome {
+        Ok(Some(CheckOutcome::Allow(_))) => ("allow", ""),
+        Ok(Some(CheckOutcome::Deny { reason, .. })) => ("deny", *reason),
+        Ok(None) => ("deny", "session_not_found"),
+        Err(_) => ("deny", "internal_error"),
+    };
+    state.metrics.check_total.with_label_values(&[decision, reason]).inc();
     match outcome {
         Ok(Some(CheckOutcome::Allow(s))) => decided(&s, &sid, "allow", None, audit_id),
         Ok(Some(CheckOutcome::Deny { session, reason })) => decided(&session, &sid, "deny", Some(reason), audit_id),
@@ -117,7 +149,7 @@ async fn kill_session(State(state): State<Arc<AppState>>, headers: HeaderMap, Pa
         }
     }
     match state.store.kill(&session_id) {
-        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"decision":"killed","session_id":session_id}))).into_response(),
+        Ok(true) => { state.metrics.kills_total.inc(); (StatusCode::OK, Json(serde_json::json!({"decision":"killed","session_id":session_id}))).into_response() }
         Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"session_not_found"}))).into_response(),
         Err(e) => internal_error(e),
     }
@@ -150,7 +182,7 @@ mod tests {
     }
 
     fn router_with_store_and_admin(store: Store, admin_token: Option<String>) -> Router {
-        router_with_state(Arc::new(AppState { store, admin_token, proxy_secret: None }))
+        router_with_state(Arc::new(AppState { store, admin_token, proxy_secret: None, metrics: build_metrics() }))
     }
 
     fn router_with_store(store: Store) -> Router {
@@ -158,7 +190,7 @@ mod tests {
     }
 
     fn router_with_proxy(store: Store, proxy_secret: Option<String>) -> Router {
-        router_with_state(Arc::new(AppState { store, admin_token: None, proxy_secret }))
+        router_with_state(Arc::new(AppState { store, admin_token: None, proxy_secret, metrics: build_metrics() }))
     }
 
     fn app() -> Router {
@@ -615,5 +647,37 @@ mod tests {
         assert_eq!(decisions, vec!["allow".to_string(), "deny".to_string()]);
         drop(db);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn metrics_req() -> HttpRequest<Body> {
+        HttpRequest::builder().method("GET").uri("/metrics").body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_records_check_decisions_kills_and_sessions() {
+        // Spec § Metrics (line 158): /metrics exposes check_total{decision,reason},
+        // check_latency_seconds, sessions_active, kills_total. This test drives 1 allow
+        // + 1 deny + 1 kill against 2 sessions, then asserts the Prometheus text body
+        // contains the expected counter lines and a sessions_active=2 gauge sample.
+        let app = app();
+        app.clone().oneshot(open_req("sess_m1", 5.0, 10, 3600)).await.unwrap();
+        app.clone().oneshot(open_req("sess_m2", 5.0, 10, 3600)).await.unwrap();
+
+        let v = body_json(app.clone().oneshot(check_model_req("sess_m1", "claude-haiku-4-5", 100, 50)).await.unwrap()).await;
+        assert_eq!(v["decision"], "allow");
+        let v = body_json(app.clone().oneshot(check_model_req("sess_m1", "unknown-model", 100, 50)).await.unwrap()).await;
+        assert_eq!(v["decision"], "deny");
+        let resp = app.clone().oneshot(kill_req("sess_m2", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app.clone().oneshot(metrics_req()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+
+        assert!(body.contains(r#"check_total{decision="allow",reason=""} 1"#), "missing allow counter: {body}");
+        assert!(body.contains(r#"check_total{decision="deny",reason="unknown_model"} 1"#), "missing deny counter: {body}");
+        assert!(body.contains("kills_total 1"), "missing kills_total: {body}");
+        assert!(body.contains("sessions_active 2"), "missing sessions_active=2 gauge: {body}");
+        assert!(body.contains("check_latency_seconds_bucket"), "missing latency histogram: {body}");
     }
 }
