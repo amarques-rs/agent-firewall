@@ -351,6 +351,7 @@ components:
             - session_expired
             - session_killed
             - tool_not_in_allowlist
+            - tool_target_blocked
             - unknown_model
             - internal_error
         session:

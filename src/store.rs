@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sled::Db;
 
 use crate::cost::estimate_usd;
-use crate::policy::tool_allowed;
+use crate::policy::{tool_allowed, ToolMatch};
 use crate::session::{Limits, Session, ToolRule};
 
 pub enum CheckOutcome {
@@ -88,12 +88,10 @@ impl Store {
 
     pub fn check_tool(&self, session_id: &str, audit_id: &str, tool_name: &str, target: Option<&str>) -> sled::Result<Option<CheckOutcome>> {
         let now = Self::now_unix();
-        let outcome = self.with_session(session_id, now, |s| {
-            if !tool_allowed(&s.tool_allowlist, tool_name, target) {
-                return CheckOutcome::Deny { session: s.clone(), reason: "tool_not_in_allowlist" };
-            }
-            s.calls_remaining -= 1;
-            CheckOutcome::Allow(s.clone())
+        let outcome = self.with_session(session_id, now, |s| match tool_allowed(&s.tool_allowlist, tool_name, target) {
+            ToolMatch::NotInAllowlist => CheckOutcome::Deny { session: s.clone(), reason: "tool_not_in_allowlist" },
+            ToolMatch::TargetBlocked => CheckOutcome::Deny { session: s.clone(), reason: "tool_target_blocked" },
+            ToolMatch::Allow => { s.calls_remaining -= 1; CheckOutcome::Allow(s.clone()) }
         })?;
         if let Some(o) = &outcome { self.append_audit(audit_id, session_id, "tool", now, o)?; }
         Ok(outcome)

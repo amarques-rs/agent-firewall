@@ -539,7 +539,7 @@ mod tests {
         )
         .await;
         assert_eq!(v["decision"], "deny", "anchored regex denies subdomain spoof");
-        assert_eq!(v["reason"], "tool_not_in_allowlist");
+        assert_eq!(v["reason"], "tool_target_blocked");
     }
 
     fn open_req_with_proxy_secret(session_id: &str, proxy_secret: Option<&str>) -> HttpRequest<Body> {
