@@ -1,46 +1,38 @@
-# fly.toml — agent-firewall v1
+# fly.toml app configuration file generated for agent-firewall on 2026-05-10T20:57:52-07:00
 #
-# `app` is left blank: `flyctl launch --copy-config --no-deploy` will prompt
-# for a name (or accept --name <slug>) and write it back. Region pinned to
-# `lax` per master.md / spec line 152.
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-app = ""
-primary_region = "lax"
+app = 'agent-firewall'
+primary_region = 'lax'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [env]
-  PORT = "8080"
-  SLED_PATH = "/data/firewall.sled"
-  RUST_LOG = "info"
+  PORT = '8080'
+  RUST_LOG = 'info'
+  SLED_PATH = '/data/firewall.sled'
 
-# Persistent sled volume. Spec § Storage: ~300 MB at 10k sessions + 1M audit
-# rows → 1GB holds months of history. Created via:
-#   flyctl volumes create firewall_data --region lax --size 1
 [[mounts]]
-  source = "firewall_data"
-  destination = "/data"
+  source = 'firewall_data'
+  destination = '/data'
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"
+  auto_stop_machines = 'stop'
   auto_start_machines = true
   min_machines_running = 1
-  processes = ["app"]
+  processes = ['app']
 
-  # HTTP health check against the public /metrics endpoint (un-gated, GET,
-  # returns Prometheus text body — see main.rs build_router). No /health
-  # route in source (would cost ~3 lines vs. the 6-line headroom) and /metrics
-  # already proves the full app graph is alive: store + registry + handler.
   [[http_service.checks]]
-    method = "GET"
-    path = "/metrics"
-    interval = "15s"
-    timeout = "2s"
-    grace_period = "10s"
+    interval = '15s'
+    timeout = '2s'
+    grace_period = '10s'
+    method = 'GET'
+    path = '/metrics'
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "256mb"
+  size = 'shared-cpu-1x'
+  memory = '256mb'
