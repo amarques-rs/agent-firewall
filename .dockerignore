@@ -1,0 +1,5 @@
+target/
+.git/
+data/
+*.sled
+.DS_Store
