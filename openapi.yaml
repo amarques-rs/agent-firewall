@@ -1,0 +1,377 @@
+openapi: 3.0.3
+info:
+  title: Agent Firewall
+  description: |
+    Hard per-session limits on dollars, tokens, calls, time, and tools — enforced
+    atomically before each LLM or tool call. Returns `allow` or one of eight
+    `deny:*` reasons in sub-5ms. Built in Rust (~400 lines), MIT licensed.
+
+    Source: https://github.com/amarques-rs/agent-firewall
+  version: "1.0.0"
+  license:
+    name: MIT
+    url: https://github.com/amarques-rs/agent-firewall/blob/main/LICENSE
+  contact:
+    name: Issues
+    url: https://github.com/amarques-rs/agent-firewall/issues
+
+servers:
+  - url: https://agentfirewall.p.rapidapi.com
+    description: RapidAPI gateway (buyers)
+  - url: https://agent-firewall.fly.dev
+    description: Origin (operators only — buyers should use the RapidAPI gateway)
+
+tags:
+  - name: gating
+    description: Buyer-facing decisions. Call before every LLM or tool invocation.
+  - name: admin
+    description: Operator-only. Bearer-token-gated; not exposed via the RapidAPI gateway.
+  - name: ops
+    description: Operator-only. Public Prometheus metrics; not for buyer use.
+
+paths:
+  /v1/session:
+    post:
+      tags: [gating]
+      summary: Open a session with limits and tool allowlist
+      description: |
+        Creates a session that subsequent `/v1/check` calls debit against.
+        Idempotent on `session_id` — re-POSTing the same id returns the current
+        state (200) instead of creating a new session (201).
+      operationId: openSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OpenSessionRequest'
+            examples:
+              basic:
+                summary: $5 / 200 calls / 1h / one allowed tool
+                value:
+                  session_id: "sess_abc123"
+                  limits:
+                    max_usd: 5.00
+                    max_input_tokens: 100000
+                    max_output_tokens: 50000
+                    max_calls: 200
+                    ttl_seconds: 3600
+                  tool_allowlist:
+                    - tool_name: "http.get"
+                      target_pattern: "^https://api\\.example\\.com/"
+      responses:
+        '201':
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionView'
+        '200':
+          description: Session already exists — current state returned (idempotent retry)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionView'
+        '400':
+          description: Malformed request body
+        '401':
+          description: Missing or invalid RapidAPI auth
+        '422':
+          description: Body parsed but failed schema validation
+        '500':
+          description: Server-side error
+
+  /v1/check:
+    post:
+      tags: [gating]
+      summary: Gate one model or tool call
+      description: |
+        Atomic check + debit against the named session. Returns `allow` (and
+        decrements remaining budget) or `deny` with one of eight reasons.
+        Always HTTP 200 on a valid session — check the `decision` field.
+        Returns 404 only if the session id doesn't exist.
+      operationId: check
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/CheckModelRequest'
+                - $ref: '#/components/schemas/CheckToolRequest'
+              discriminator:
+                propertyName: kind
+                mapping:
+                  model: '#/components/schemas/CheckModelRequest'
+                  tool: '#/components/schemas/CheckToolRequest'
+            examples:
+              model:
+                summary: Check before a model call
+                value:
+                  kind: "model"
+                  session_id: "sess_abc123"
+                  model: "claude-opus-4-7"
+                  projected_input_tokens: 2400
+                  projected_output_tokens: 1200
+              tool:
+                summary: Check before a tool call
+                value:
+                  kind: "tool"
+                  session_id: "sess_abc123"
+                  tool_name: "http.get"
+                  tool_target: "https://api.example.com/users"
+      responses:
+        '200':
+          description: Decision returned (allow or deny — check `decision`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckResponse'
+        '401':
+          description: Missing or invalid RapidAPI auth
+        '404':
+          description: Session id not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionNotFound'
+
+  /v1/session/{id}/kill:
+    post:
+      tags: [admin]
+      summary: Kill a session — subsequent /v1/check calls deny with session_killed
+      description: |
+        Admin-only. Not exposed via the RapidAPI gateway. Requires
+        `Authorization: Bearer <ADMIN_TOKEN>` against the origin server.
+      operationId: killSession
+      security:
+        - adminBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Session killed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  decision: { type: string, enum: [killed] }
+                  session_id: { type: string }
+        '401':
+          description: Missing or invalid admin bearer token
+        '404':
+          description: Session id not found
+
+  /metrics:
+    get:
+      tags: [ops]
+      summary: Prometheus metrics (text exposition format)
+      description: |
+        Operator-only. Public (no auth) on the origin server; not exposed via
+        the RapidAPI gateway. Exposes `check_total{decision,reason}`,
+        `check_latency_seconds` (histogram, buckets at 1/2/5/10/25/50/100 ms),
+        `sessions_active`, `kills_total`.
+      operationId: metrics
+      responses:
+        '200':
+          description: Prometheus text exposition
+          content:
+            text/plain:
+              schema:
+                type: string
+
+components:
+  securitySchemes:
+    rapidApiKey:
+      type: apiKey
+      in: header
+      name: X-RapidAPI-Key
+      description: Provided by RapidAPI; the gateway forwards proxied requests to the origin.
+    rapidApiHost:
+      type: apiKey
+      in: header
+      name: X-RapidAPI-Host
+      description: Always `agentfirewall.p.rapidapi.com`.
+    adminBearer:
+      type: http
+      scheme: bearer
+      description: Origin-only. `ADMIN_TOKEN` from Fly secrets.
+
+  schemas:
+    Limits:
+      type: object
+      required: [max_usd, max_input_tokens, max_output_tokens, max_calls, ttl_seconds]
+      properties:
+        max_usd:
+          type: number
+          format: double
+          minimum: 0
+          example: 5.00
+        max_input_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+          example: 100000
+        max_output_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+          example: 50000
+        max_calls:
+          type: integer
+          format: int64
+          minimum: 1
+          example: 200
+        ttl_seconds:
+          type: integer
+          format: int64
+          minimum: 1
+          example: 3600
+
+    ToolRule:
+      type: object
+      required: [tool_name]
+      properties:
+        tool_name:
+          type: string
+          example: "http.get"
+        target_pattern:
+          type: string
+          description: |
+            Anchored regex applied to the call's `tool_target`. Use `^` and `$`
+            to prevent prefix-spoofing — `^https://api\.example\.com/.*` rejects
+            `https://evil.com/api.example.com/users`.
+          example: "^https://api\\.example\\.com/.*"
+
+    OpenSessionRequest:
+      type: object
+      required: [session_id, limits]
+      properties:
+        session_id:
+          type: string
+          maxLength: 128
+          description: Client-supplied. Unique per session. Re-POSTing the same id is idempotent.
+          example: "sess_abc123"
+        policy_id:
+          type: string
+          description: Optional client tag — preserved on the session row for audit/grouping.
+        limits:
+          $ref: '#/components/schemas/Limits'
+        tool_allowlist:
+          type: array
+          items:
+            $ref: '#/components/schemas/ToolRule'
+          default: []
+
+    CheckModelRequest:
+      type: object
+      required: [kind, session_id, model, projected_input_tokens, projected_output_tokens]
+      properties:
+        kind:
+          type: string
+          enum: [model]
+        session_id:
+          type: string
+          example: "sess_abc123"
+        model:
+          type: string
+          description: |
+            Must appear in the firewall's cost table. Currently: Claude 4.x family
+            (haiku-4-5, sonnet-4-6, opus-4-7) and GPT-4.1 / 4.1-mini / 5 / 5-mini.
+            Anything else returns `deny: unknown_model` — fail loud, not silent.
+          example: "claude-opus-4-7"
+        projected_input_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+          example: 2400
+        projected_output_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+          example: 1200
+
+    CheckToolRequest:
+      type: object
+      required: [kind, session_id, tool_name]
+      properties:
+        kind:
+          type: string
+          enum: [tool]
+        session_id:
+          type: string
+          example: "sess_abc123"
+        tool_name:
+          type: string
+          example: "http.get"
+        tool_target:
+          type: string
+          description: Optional. Matched against the `target_pattern` of the matching `tool_allowlist` rule (if any).
+          example: "https://api.example.com/users"
+
+    SessionView:
+      type: object
+      required: [session_id, tokens_used, tokens_remaining, usd_used, usd_remaining, calls_remaining]
+      properties:
+        session_id: { type: string }
+        tokens_used:
+          type: integer
+          format: int64
+          description: Total tokens (input + output) debited so far across the session.
+        tokens_remaining:
+          type: integer
+          format: int64
+          description: |
+            Sum of remaining input + output budget. The two caps are summed at
+            session creation into one fungible pool; `/v1/check` debits
+            `projected_input + projected_output` from this counter.
+        usd_used: { type: number, format: double }
+        usd_remaining: { type: number, format: double }
+        calls_remaining: { type: integer, format: int64 }
+
+    CheckResponse:
+      type: object
+      required: [decision, session, audit_id]
+      properties:
+        decision:
+          type: string
+          enum: [allow, deny]
+        reason:
+          type: string
+          nullable: true
+          enum:
+            - session_budget_exhausted_usd
+            - session_budget_exhausted_tokens
+            - session_budget_exhausted_calls
+            - session_expired
+            - session_killed
+            - tool_not_in_allowlist
+            - unknown_model
+            - internal_error
+        session:
+          $ref: '#/components/schemas/SessionView'
+        audit_id:
+          type: string
+          description: ULID-prefixed identifier of the audit row appended to the firewall's sled store.
+          example: "evt_01KRAT7RQX3PC3KVQ28NR75FJT"
+
+    SessionNotFound:
+      type: object
+      properties:
+        decision:
+          type: string
+          enum: [deny]
+        reason:
+          type: string
+          enum: [session_not_found]
+        audit_id:
+          type: string
+
+security:
+  - rapidApiKey: []
+    rapidApiHost: []
