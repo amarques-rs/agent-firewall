@@ -1,11 +1,12 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Request, State},
     http::{HeaderMap, StatusCode},
+    middleware::{from_fn_with_state, Next},
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::sync::Arc;
 use ulid::Ulid;
 
@@ -15,11 +16,12 @@ mod session;
 mod store;
 
 use session::{Limits, Session, ToolRule};
-use store::{Outcome, Store};
+use store::{CheckOutcome, Store};
 
 struct AppState {
     store: Store,
     admin_token: Option<String>,
+    proxy_secret: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -30,16 +32,6 @@ struct OpenSessionReq {
     limits: Limits,
     #[serde(default)]
     tool_allowlist: Vec<ToolRule>,
-}
-
-#[derive(Serialize)]
-struct SessionView {
-    session_id: String,
-    tokens_used: u64,
-    tokens_remaining: u64,
-    usd_used: f64,
-    usd_remaining: f64,
-    calls_remaining: u64,
 }
 
 #[derive(Deserialize)]
@@ -59,27 +51,15 @@ enum CheckReq {
     },
 }
 
-#[derive(Serialize)]
-struct CheckResp {
-    decision: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<&'static str>,
-    session: SessionView,
-    audit_id: String,
-}
-
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().json().init();
     let sled_path = std::env::var("SLED_PATH").unwrap_or_else(|_| "data/firewall.sled".into());
     let store = Store::open(&sled_path).expect("open sled db");
     let admin_token = std::env::var("ADMIN_TOKEN").ok().filter(|s| !s.is_empty());
-    let state = Arc::new(AppState { store, admin_token });
-    let app = Router::new()
-        .route("/v1/session", post(open_session))
-        .route("/v1/session/:id/kill", post(kill_session))
-        .route("/v1/check", post(check))
-        .with_state(state);
+    let proxy_secret = std::env::var("RAPIDAPI_PROXY_SECRET").ok().filter(|s| !s.is_empty());
+    let state = Arc::new(AppState { store, admin_token, proxy_secret });
+    let app = build_router(state);
     let port: u16 = std::env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8080);
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -87,13 +67,27 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
+fn build_router(state: Arc<AppState>) -> Router {
+    let gated = Router::new()
+        .route("/v1/session", post(open_session))
+        .route("/v1/check", post(check))
+        .route_layer(from_fn_with_state(state.clone(), proxy_secret_mw));
+    gated.route("/v1/session/:id/kill", post(kill_session)).with_state(state)
+}
+
+async fn proxy_secret_mw(State(state): State<Arc<AppState>>, headers: HeaderMap, req: Request, next: Next) -> Response {
+    if let Some(want) = &state.proxy_secret {
+        let got = headers.get("x-rapidapi-proxy-secret").and_then(|h| h.to_str().ok());
+        if got != Some(want.as_str()) {
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"unauthorized"}))).into_response();
+        }
+    }
+    next.run(req).await
+}
+
 async fn open_session(State(state): State<Arc<AppState>>, Json(req): Json<OpenSessionReq>) -> Response {
     match state.store.open_session(&req.session_id, req.limits, req.tool_allowlist, req.policy_id) {
-        Ok(Outcome::Opened { session, is_new }) => {
-            let code = if is_new { StatusCode::CREATED } else { StatusCode::OK };
-            (code, Json(view_from(&req.session_id, &session))).into_response()
-        }
-        Ok(_) => unreachable!(),
+        Ok((s, is_new)) => (if is_new { StatusCode::CREATED } else { StatusCode::OK }, Json(view(&req.session_id, &s))).into_response(),
         Err(e) => internal_error(e),
     }
 }
@@ -104,23 +98,18 @@ async fn check(State(state): State<Arc<AppState>>, Json(req): Json<CheckReq>) ->
         CheckReq::Model { session_id, .. } | CheckReq::Tool { session_id, .. } => session_id.clone(),
     };
     let outcome = match req {
-        CheckReq::Model { model, projected_input_tokens, projected_output_tokens, .. } => state.store.check_model(&sid, &model, projected_input_tokens, projected_output_tokens),
-        CheckReq::Tool { tool_name, tool_target, .. } => state.store.check_tool(&sid, &tool_name, tool_target.as_deref()),
+        CheckReq::Model { model, projected_input_tokens, projected_output_tokens, .. } => state.store.check_model(&sid, &audit_id, &model, projected_input_tokens, projected_output_tokens),
+        CheckReq::Tool { tool_name, tool_target, .. } => state.store.check_tool(&sid, &audit_id, &tool_name, tool_target.as_deref()),
     };
     match outcome {
-        Ok(Outcome::Allow(s)) => decided(&s, &sid, "allow", None, audit_id),
-        Ok(Outcome::Deny { session, reason }) => decided(&session, &sid, "deny", Some(reason), audit_id),
-        Ok(Outcome::NotFound) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"decision":"deny","reason":"session_not_found","audit_id":audit_id}))).into_response(),
-        Ok(Outcome::Opened { .. }) => unreachable!(),
+        Ok(Some(CheckOutcome::Allow(s))) => decided(&s, &sid, "allow", None, audit_id),
+        Ok(Some(CheckOutcome::Deny { session, reason })) => decided(&session, &sid, "deny", Some(reason), audit_id),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"decision":"deny","reason":"session_not_found","audit_id":audit_id}))).into_response(),
         Err(e) => internal_error(e),
     }
 }
 
-async fn kill_session(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(session_id): Path<String>,
-) -> Response {
+async fn kill_session(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(session_id): Path<String>) -> Response {
     if let Some(want) = &state.admin_token {
         let got = headers.get("authorization").and_then(|h| h.to_str().ok()).and_then(|h| h.strip_prefix("Bearer "));
         if got != Some(want.as_str()) {
@@ -134,8 +123,8 @@ async fn kill_session(
     }
 }
 
-fn decided(s: &Session, sid: &str, decision: &'static str, reason: Option<&'static str>, audit_id: String) -> Response {
-    (StatusCode::OK, Json(CheckResp { decision, reason, session: view_from(sid, s), audit_id })).into_response()
+fn decided(s: &Session, sid: &str, decision: &str, reason: Option<&str>, audit_id: String) -> Response {
+    (StatusCode::OK, Json(serde_json::json!({"decision":decision,"reason":reason,"session":view(sid, s),"audit_id":audit_id}))).into_response()
 }
 
 fn internal_error(e: sled::Error) -> Response {
@@ -143,37 +132,33 @@ fn internal_error(e: sled::Error) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"decision":"deny","reason":"internal_error"}))).into_response()
 }
 
-fn view_from(sid: &str, s: &Session) -> SessionView {
+fn view(sid: &str, s: &Session) -> serde_json::Value {
     let r = |x: f64| (x * 100.0).round() / 100.0;
-    SessionView {
-        session_id: sid.to_string(),
-        tokens_used: s.tokens_used,
-        tokens_remaining: s.tokens_remaining,
-        usd_used: r(s.usd_used),
-        usd_remaining: r(s.usd_remaining),
-        calls_remaining: s.calls_remaining,
-    }
+    serde_json::json!({"session_id": sid, "tokens_used": s.tokens_used, "tokens_remaining": s.tokens_remaining, "usd_used": r(s.usd_used), "usd_remaining": r(s.usd_remaining), "calls_remaining": s.calls_remaining})
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Body;
-    use axum::http::Request;
+    use axum::http::Request as HttpRequest;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
+    fn router_with_state(state: Arc<AppState>) -> Router {
+        build_router(state)
+    }
+
     fn router_with_store_and_admin(store: Store, admin_token: Option<String>) -> Router {
-        let state = Arc::new(AppState { store, admin_token });
-        Router::new()
-            .route("/v1/session", post(open_session))
-            .route("/v1/session/:id/kill", post(kill_session))
-            .route("/v1/check", post(check))
-            .with_state(state)
+        router_with_state(Arc::new(AppState { store, admin_token, proxy_secret: None }))
     }
 
     fn router_with_store(store: Store) -> Router {
         router_with_store_and_admin(store, None)
+    }
+
+    fn router_with_proxy(store: Store, proxy_secret: Option<String>) -> Router {
+        router_with_state(Arc::new(AppState { store, admin_token: None, proxy_secret }))
     }
 
     fn app() -> Router {
@@ -185,8 +170,8 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    fn open_req(session_id: &str, max_usd: f64, max_calls: u64, ttl: u64) -> Request<Body> {
-        Request::builder()
+    fn open_req(session_id: &str, max_usd: f64, max_calls: u64, ttl: u64) -> HttpRequest<Body> {
+        HttpRequest::builder()
             .method("POST")
             .uri("/v1/session")
             .header("content-type", "application/json")
@@ -207,8 +192,8 @@ mod tests {
             .unwrap()
     }
 
-    fn check_model_req(session_id: &str, model: &str, input: u64, output: u64) -> Request<Body> {
-        Request::builder()
+    fn check_model_req(session_id: &str, model: &str, input: u64, output: u64) -> HttpRequest<Body> {
+        HttpRequest::builder()
             .method("POST")
             .uri("/v1/check")
             .header("content-type", "application/json")
@@ -225,8 +210,8 @@ mod tests {
             .unwrap()
     }
 
-    fn check_tool_req(session_id: &str, tool_name: &str) -> Request<Body> {
-        Request::builder()
+    fn check_tool_req(session_id: &str, tool_name: &str) -> HttpRequest<Body> {
+        HttpRequest::builder()
             .method("POST")
             .uri("/v1/check")
             .header("content-type", "application/json")
@@ -241,8 +226,8 @@ mod tests {
             .unwrap()
     }
 
-    fn check_tool_target_req(session_id: &str, tool_name: &str, target: &str) -> Request<Body> {
-        Request::builder()
+    fn check_tool_target_req(session_id: &str, tool_name: &str, target: &str) -> HttpRequest<Body> {
+        HttpRequest::builder()
             .method("POST")
             .uri("/v1/check")
             .header("content-type", "application/json")
@@ -258,8 +243,8 @@ mod tests {
             .unwrap()
     }
 
-    fn open_with_pattern_req(session_id: &str, tool_name: &str, target_pattern: &str) -> Request<Body> {
-        Request::builder()
+    fn open_with_pattern_req(session_id: &str, tool_name: &str, target_pattern: &str) -> HttpRequest<Body> {
+        HttpRequest::builder()
             .method("POST")
             .uri("/v1/session")
             .header("content-type", "application/json")
@@ -409,8 +394,8 @@ mod tests {
         assert_eq!(denies_usd, 48, "the other 48 must be USD-exhausted denies");
     }
 
-    fn kill_req(session_id: &str, bearer: Option<&str>) -> Request<Body> {
-        let mut b = Request::builder()
+    fn kill_req(session_id: &str, bearer: Option<&str>) -> HttpRequest<Body> {
+        let mut b = HttpRequest::builder()
             .method("POST")
             .uri(format!("/v1/session/{session_id}/kill"))
             .header("content-type", "application/json");
@@ -523,5 +508,112 @@ mod tests {
         .await;
         assert_eq!(v["decision"], "deny", "anchored regex denies subdomain spoof");
         assert_eq!(v["reason"], "tool_not_in_allowlist");
+    }
+
+    fn open_req_with_proxy_secret(session_id: &str, proxy_secret: Option<&str>) -> HttpRequest<Body> {
+        let mut b = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/session")
+            .header("content-type", "application/json");
+        if let Some(s) = proxy_secret {
+            b = b.header("x-rapidapi-proxy-secret", s);
+        }
+        b.body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "session_id": session_id,
+                "limits": {"max_usd": 5.0, "max_input_tokens": 1000, "max_output_tokens": 1000, "max_calls": 10, "ttl_seconds": 3600},
+                "tool_allowlist": []
+            }))
+            .unwrap(),
+        ))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn proxy_secret_gates_session_and_check_but_not_kill() {
+        // proxy_secret configured → /v1/session and /v1/check require X-RapidAPI-Proxy-Secret.
+        // /v1/session/:id/kill is behind admin_token, not proxy_secret — must NOT require this header.
+        let app = router_with_proxy(Store::temporary().unwrap(), Some("rapid-s3cret".into()));
+
+        // No header → 401.
+        let resp = app.clone().oneshot(open_req_with_proxy_secret("sess_proxy", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Wrong header → 401.
+        let resp = app.clone().oneshot(open_req_with_proxy_secret("sess_proxy", Some("wrong"))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Correct header → 201 (session opens).
+        let resp = app.clone().oneshot(open_req_with_proxy_secret("sess_proxy", Some("rapid-s3cret"))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // /v1/check with correct header → 200.
+        let mut check = check_model_req("sess_proxy", "claude-haiku-4-5", 100, 50);
+        check.headers_mut().insert("x-rapidapi-proxy-secret", "rapid-s3cret".parse().unwrap());
+        let resp = app.clone().oneshot(check).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // /v1/check without header → 401.
+        let resp = app.clone().oneshot(check_model_req("sess_proxy", "claude-haiku-4-5", 100, 50)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // /v1/session/:id/kill WITHOUT proxy-secret header → must NOT be gated by the proxy mw.
+        // admin_token is None here, so kill succeeds with 200 (or 404 if session lookup were off).
+        let resp = app.clone().oneshot(kill_req("sess_proxy", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "kill endpoint is behind admin_token, not proxy_secret");
+    }
+
+    #[tokio::test]
+    async fn audit_rows_persist_for_allow_and_deny() {
+        // Open a session, fire 1 allow + 1 deny (unknown_model), then verify 2 audit rows
+        // exist in sled under the `audit/` prefix with the bincode tuple shape spec'd in
+        // `output/v1-spec-agent-firewall.md ## Storage / state`.
+        let dir = std::env::temp_dir().join(format!("agent-firewall-audit-{}", Ulid::new()));
+        {
+            let store = Store::open(&dir).unwrap();
+            let app = router_with_store(store);
+            app.clone().oneshot(open_req("sess_audit", 5.0, 10, 3600)).await.unwrap();
+
+            let v = body_json(
+                app.clone()
+                    .oneshot(check_model_req("sess_audit", "claude-haiku-4-5", 100, 50))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(v["decision"], "allow");
+
+            let v = body_json(
+                app.clone()
+                    .oneshot(check_model_req("sess_audit", "unknown-model", 100, 50))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(v["decision"], "deny");
+            assert_eq!(v["reason"], "unknown_model");
+        }
+        // Reopen sled directly to inspect persisted audit rows.
+        let db = sled::Config::new().path(&dir).open().unwrap();
+        let rows: Vec<_> = db
+            .scan_prefix(b"audit/")
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2, "exactly one audit row per /v1/check");
+
+        let mut decisions: Vec<String> = rows
+            .iter()
+            .map(|(_, v)| {
+                let (decision, _reason, sid, _ts, kind): (String, Option<String>, String, u64, String) =
+                    bincode::deserialize(v).expect("decode audit row");
+                assert_eq!(sid, "sess_audit");
+                assert_eq!(kind, "model");
+                decision
+            })
+            .collect();
+        decisions.sort();
+        assert_eq!(decisions, vec!["allow".to_string(), "deny".to_string()]);
+        drop(db);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
